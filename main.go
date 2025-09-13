@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/deoreal/chirpy/internal/auth"
 	"github.com/deoreal/chirpy/internal/database"
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
@@ -56,10 +57,11 @@ type cleanedJSON struct {
 }
 
 type User struct {
-	ID        uuid.UUID `json:"id"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	Email     string    `json:"email"`
+	ID             uuid.UUID `json:"id"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
+	Email          string    `json:"email"`
+	HashedPassword string    `json:"hashed_password"`
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -88,7 +90,7 @@ func (cfg *apiConfig) metrics(w http.ResponseWriter, req *http.Request) {
 }
 
 func (cfg *apiConfig) reset(w http.ResponseWriter, req *http.Request) {
-	sqlStatement := fmt.Sprintf("TRUNCATE TABLE %s", "users")
+	sqlStatement := fmt.Sprintf("TRUNCATE TABLE %s", "chirpmsgs,users")
 	//	cfg.fileserverHits.Store(0)
 	//	resp := fmt.Sprintf("Hits: %d", cfg.fileserverHits.Load())
 	//	w.Write([]byte(resp))
@@ -139,22 +141,30 @@ func cleanProfanities(s string) string {
 }
 
 func (cfg *apiConfig) userAdd(w http.ResponseWriter, req *http.Request) {
-	type userEmail struct {
-		Email string `json:"email"`
+	type userCredentials struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
 	}
-	var e userEmail
+	var uc userCredentials
 	decoder := json.NewDecoder(req.Body)
-	err := decoder.Decode(&e)
+	err := decoder.Decode(&uc)
 	if err != nil {
 		log.Printf("Error decoding email address %s", err)
 		w.WriteHeader(500)
 		js, _ := json.Marshal(jsonError{Error: "Something went wrong"})
 		w.Write(js)
 	}
+	pw, err := auth.HashPassword(uc.Password)
+	if err != nil {
+		log.Printf("Error hashing password %s", err)
+		w.WriteHeader(500)
+		js, _ := json.Marshal(jsonError{Error: "Something went wrong"})
+		w.Write(js)
 
-	user, _ := cfg.dbQueries.CreateUser(req.Context(), e.Email)
+	}
+	user, _ := cfg.dbQueries.CreateUser(req.Context(), database.CreateUserParams{Email: uc.Email, HashedPassword: pw})
 	fmt.Println("user", user)
-	usr := User{ID: user.ID, CreatedAt: user.CreatedAt, UpdatedAt: user.UpdatedAt, Email: user.Email}
+	usr := User{ID: user.ID, CreatedAt: user.CreatedAt, UpdatedAt: user.UpdatedAt, Email: user.Email, HashedPassword: "***"}
 
 	w.Header().Set("Content-Type", "text/json; charset=utf-8")
 	w.WriteHeader(201)
@@ -218,6 +228,57 @@ func (cfg *apiConfig) getChirps(w http.ResponseWriter, req *http.Request) {
 	w.Write(js)
 }
 
+func (cfg *apiConfig) login(w http.ResponseWriter, req *http.Request) {
+	type userCredentials struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+
+	var uc userCredentials
+	decoder := json.NewDecoder(req.Body)
+	err := decoder.Decode(&uc)
+	if err != nil {
+		log.Printf("Error decoding json parameters: %s", err)
+		w.WriteHeader(400)
+		js, _ := json.Marshal(jsonError{Error: "Invalid request body"})
+		w.Write(js)
+		return
+	}
+
+	// Get user from database by email
+	user, err := cfg.dbQueries.GetUser(req.Context(), uc.Email)
+	if err != nil {
+		log.Printf("Error getting user: %s", err)
+		w.WriteHeader(401)
+		js, _ := json.Marshal(jsonError{Error: "Incorrect email or password"})
+		w.Write(js)
+		return
+	}
+
+	// Check password
+	err = auth.CheckPasswordHash(uc.Password, user.HashedPassword)
+	if err != nil {
+		log.Printf("Password validation failed: %s", err)
+		w.WriteHeader(401)
+		js, _ := json.Marshal(jsonError{Error: "Incorrect email or password"})
+		w.Write(js)
+		return
+	}
+
+	// Return user info (without password)
+	usr := User{
+		ID:        user.ID,
+		CreatedAt: user.CreatedAt,
+		UpdatedAt: user.UpdatedAt,
+		Email:     user.Email,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	js, _ := json.Marshal(usr)
+	w.Write(js)
+}
+
 func (cfg *apiConfig) getChirp(w http.ResponseWriter, req *http.Request) {
 	uuid, _ := uuid.Parse(req.PathValue("chirpID"))
 
@@ -226,7 +287,7 @@ func (cfg *apiConfig) getChirp(w http.ResponseWriter, req *http.Request) {
 		log.Printf("Error db query %s", err)
 		w.WriteHeader(404)
 		//	js, _ := json.Marshal(jsonError{Error: "Something went wrong"})
-		w.Write([]byte("chrip not found"))
+		w.Write([]byte("chirp not found"))
 		return
 	}
 	empty := database.Chirpmsg{}
@@ -244,8 +305,9 @@ func (cfg *apiConfig) getChirp(w http.ResponseWriter, req *http.Request) {
 func main() {
 	godotenv.Load()
 
-	dbURL := os.Getenv("DB_URL")
+	dbURL := os.Getenv("DBURL")
 
+	fmt.Println("dburl", dbURL)
 	a := new(apiConfig)
 
 	db, err := sql.Open("postgres", dbURL)
@@ -262,6 +324,7 @@ func main() {
 	mux.HandleFunc("GET /admin/metrics", a.metrics)
 	mux.HandleFunc("POST /admin/reset", a.reset)
 	mux.HandleFunc("POST /api/users", a.userAdd)
+	mux.HandleFunc("POST /api/login", a.login)
 	mux.HandleFunc("GET /api/chirps", a.getChirps)
 	mux.HandleFunc("POST /api/chirps", a.addChirp)
 	mux.HandleFunc("GET /api/chirps/{chirpID}", a.getChirp)
