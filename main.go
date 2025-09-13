@@ -18,10 +18,13 @@ import (
 	_ "github.com/lib/pq"
 )
 
+var tokenSecret string
+
 type apiConfig struct {
 	fileserverHits atomic.Int32
 	dbQueries      *database.Queries
 	db             *sql.DB
+	TokenSecret    string
 }
 type Chirp struct {
 	ID        uuid.UUID `json:"id"`
@@ -62,6 +65,7 @@ type User struct {
 	UpdatedAt      time.Time `json:"updated_at"`
 	Email          string    `json:"email"`
 	HashedPassword string    `json:"hashed_password"`
+	Token          string    `json:"token"`
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -70,6 +74,28 @@ func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
 
 		//		fmt.Printf("Hits: %d\n", cfg.fileserverHits.Load())
 		next.ServeHTTP(w, req)
+	})
+}
+
+func (cfg *apiConfig) middlewareTokenAuth(next http.HandlerFunc) http.HandlerFunc {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token, err := auth.GetBearerToken(r.Header)
+		if err != nil {
+			log.Printf("No Bearer Token  %s", err)
+			w.WriteHeader(401)
+			js, _ := json.Marshal(jsonError{Error: "Unauthorized"})
+			w.Write(js)
+		}
+
+		_, err = auth.ValidateJWT(token, cfg.TokenSecret)
+		if err != nil {
+			log.Printf("Invalid Token  %s", err)
+			w.WriteHeader(401)
+			js, _ := json.Marshal(jsonError{Error: "Unauthorized"})
+			w.Write(js)
+		}
+
+		next.ServeHTTP(w, r)
 	})
 }
 
@@ -230,8 +256,9 @@ func (cfg *apiConfig) getChirps(w http.ResponseWriter, req *http.Request) {
 
 func (cfg *apiConfig) login(w http.ResponseWriter, req *http.Request) {
 	type userCredentials struct {
-		Email    string `json:"email"`
-		Password string `json:"password"`
+		Email      string `json:"email"`
+		Password   string `json:"password"`
+		Expiration int    `json:"expires_in_seconds,omitempty"`
 	}
 
 	var uc userCredentials
@@ -245,6 +272,9 @@ func (cfg *apiConfig) login(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	if uc.Expiration == 0 || uc.Expiration >= 3600 {
+		uc.Expiration = 3600
+	}
 	// Get user from database by email
 	user, err := cfg.dbQueries.GetUser(req.Context(), uc.Email)
 	if err != nil {
@@ -265,12 +295,22 @@ func (cfg *apiConfig) login(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	tk, err := auth.MakeJWT(user.ID, cfg.TokenSecret, time.Duration(uc.Expiration))
+	if err != nil {
+		log.Printf("Error creating token %s:", err)
+		w.WriteHeader(400)
+		js, _ := json.Marshal(jsonError{Error: "Invalid request body"})
+		w.Write(js)
+		return
+	}
+
 	// Return user info (without password)
 	usr := User{
 		ID:        user.ID,
 		CreatedAt: user.CreatedAt,
 		UpdatedAt: user.UpdatedAt,
 		Email:     user.Email,
+		Token:     tk,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -306,6 +346,8 @@ func main() {
 	godotenv.Load()
 
 	dbURL := os.Getenv("DBURL")
+	tokenSecret = os.Getenv("TOKENSECRET")
+	fmt.Println("token-secret", tokenSecret)
 
 	fmt.Println("dburl", dbURL)
 	a := new(apiConfig)
@@ -316,6 +358,7 @@ func main() {
 	}
 	a.db = db
 	a.dbQueries = database.New(db)
+	a.TokenSecret = tokenSecret
 
 	mux := http.NewServeMux()
 	mux.Handle("/app/", a.middlewareMetricsInc(http.StripPrefix("/app", http.FileServer(http.Dir("./")))))
@@ -326,7 +369,7 @@ func main() {
 	mux.HandleFunc("POST /api/users", a.userAdd)
 	mux.HandleFunc("POST /api/login", a.login)
 	mux.HandleFunc("GET /api/chirps", a.getChirps)
-	mux.HandleFunc("POST /api/chirps", a.addChirp)
+	mux.HandleFunc("POST /api/chirps", a.middlewareTokenAuth(a.addChirp))
 	mux.HandleFunc("GET /api/chirps/{chirpID}", a.getChirp)
 
 	err = http.ListenAndServe("localhost:8080", mux)
